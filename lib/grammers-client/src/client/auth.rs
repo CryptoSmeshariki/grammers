@@ -413,7 +413,6 @@ impl Client {
                 }
                 Ok(tl::enums::auth::Authorization::SignUpRequired(_x)) => panic!("Unexpected result"),
                 Err(err) if err.is("PASSWORD_HASH_INVALID") => {
-                    dbg!(try_no);
                     password_info = self
                         .get_password_information()
                         .await
