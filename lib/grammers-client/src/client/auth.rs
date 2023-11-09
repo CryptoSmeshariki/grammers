@@ -371,49 +371,66 @@ impl Client {
     pub async fn check_password(
         &self,
         password_token: PasswordToken,
-        password: impl AsRef<[u8]>,
+        password: impl AsRef<[u8]> + Clone,
     ) -> Result<User, SignInError> {
         let mut password_info = password_token.password;
         let current_algo = password_info.current_algo.unwrap();
         let mut params = utils::extract_password_parameters(&current_algo);
 
-        // Telegram sent us incorrect parameters, trying to get them again
-        if !check_p_and_g(params.2, params.3) {
-            password_info = self
-                .get_password_information()
-                .await
-                .map_err(SignInError::Other)?
-                .password;
-            params =
-                utils::extract_password_parameters(password_info.current_algo.as_ref().unwrap());
+        for try_no in 0..7 {
+            // Telegram sent us incorrect parameters, trying to get them again
             if !check_p_and_g(params.2, params.3) {
-                panic!("Failed to get correct password information from Telegram")
+                password_info = self
+                    .get_password_information()
+                    .await
+                    .map_err(SignInError::Other)?
+                    .password;
+                params =
+                    utils::extract_password_parameters(password_info.current_algo.as_ref().unwrap());
+                if !check_p_and_g(params.2, params.3) {
+                    panic!("Failed to get correct password information from Telegram")
+                }
+            }
+
+            let (salt1, salt2, g, p) = params;
+
+            let g_b = password_info.srp_b.unwrap();
+            let a: Vec<u8> = password_info.secure_random;
+
+            let (m1, g_a) = calculate_2fa(salt1, salt2, g, p, g_b, a, password.clone());
+
+            let check_password = tl::functions::auth::CheckPassword {
+                password: tl::enums::InputCheckPasswordSrp::Srp(tl::types::InputCheckPasswordSrp {
+                    srp_id: password_info.srp_id.unwrap(),
+                    a: g_a.to_vec(),
+                    m1: m1.to_vec(),
+                }),
+            };
+
+            match self.invoke(&check_password).await {
+                Ok(tl::enums::auth::Authorization::Authorization(x)) => {
+                    return self.complete_login(x).await.map_err(SignInError::Other)
+                }
+                Ok(tl::enums::auth::Authorization::SignUpRequired(_x)) => panic!("Unexpected result"),
+                Err(err) if err.is("PASSWORD_HASH_INVALID") => {
+                    dbg!(try_no);
+                    password_info = self
+                        .get_password_information()
+                        .await
+                        .map_err(SignInError::Other)?
+                        .password;
+                    params =
+                        utils::extract_password_parameters(password_info.current_algo.as_ref().unwrap());
+
+                    continue;
+                }
+                    ,
+                Err(error) => return Err(SignInError::Other(error)),
             }
         }
 
-        let (salt1, salt2, g, p) = params;
+        Err(SignInError::InvalidPassword)
 
-        let g_b = password_info.srp_b.unwrap();
-        let a: Vec<u8> = password_info.secure_random;
-
-        let (m1, g_a) = calculate_2fa(salt1, salt2, g, p, g_b, a, password);
-
-        let check_password = tl::functions::auth::CheckPassword {
-            password: tl::enums::InputCheckPasswordSrp::Srp(tl::types::InputCheckPasswordSrp {
-                srp_id: password_info.srp_id.unwrap(),
-                a: g_a.to_vec(),
-                m1: m1.to_vec(),
-            }),
-        };
-
-        match self.invoke(&check_password).await {
-            Ok(tl::enums::auth::Authorization::Authorization(x)) => {
-                self.complete_login(x).await.map_err(SignInError::Other)
-            }
-            Ok(tl::enums::auth::Authorization::SignUpRequired(_x)) => panic!("Unexpected result"),
-            Err(err) if err.is("PASSWORD_HASH_INVALID") => Err(SignInError::InvalidPassword),
-            Err(error) => Err(SignInError::Other(error)),
-        }
     }
 
     /// Signs out of the account authorized by this client's session.
