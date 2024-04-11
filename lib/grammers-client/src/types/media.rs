@@ -32,7 +32,7 @@ pub struct Sticker {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Uploaded {
-    pub(crate) input_file: tl::enums::InputFile,
+    pub input_file: tl::enums::InputFile,
 }
 
 #[derive(Clone, Debug, PartialEq)]
