@@ -138,7 +138,7 @@ pub fn parse_markdown_message(message: &str) -> (String, Vec<tl::enums::MessageE
             if url.starts_with(MENTION_URL_PREFIX) {
                 update_entity_len!(MentionName(offset) => entities);
             } else if url.starts_with("emoji/") {
-                update_entity_len!(MessageEntityCustomEmoji(offset) => entities);
+                update_entity_len!(CustomEmoji(offset) => entities);
             } else {
                 update_entity_len!(TextUrl(offset) => entities);
             }
