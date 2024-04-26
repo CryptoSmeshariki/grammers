@@ -123,9 +123,13 @@ pub fn parse_markdown_message(message: &str) -> (String, Vec<tl::enums::MessageE
 
         // [text link](https://example.com) or [user mention](tg://user?id=12345678)
         Event::Start(Tag::Link(_kind, url, _title)) => {
+
             if url.starts_with(MENTION_URL_PREFIX) {
                 let user_id = url[MENTION_URL_PREFIX.len()..].parse::<i64>().unwrap();
                 push_entity!(MessageEntityMentionName(offset, user_id = user_id) => entities);
+            } else if url.starts_with("emoji/") {
+                let document_id = url["emoji/".len()..].parse::<i64>().unwrap();
+                push_entity!(MessageEntityCustomEmoji(offset, document_id = document_id) => entities);
             } else {
                 push_entity!(MessageEntityTextUrl(offset, url = url.to_string()) => entities);
             }
@@ -133,6 +137,8 @@ pub fn parse_markdown_message(message: &str) -> (String, Vec<tl::enums::MessageE
         Event::End(Tag::Link(_kindd, url, _title)) => {
             if url.starts_with(MENTION_URL_PREFIX) {
                 update_entity_len!(MentionName(offset) => entities);
+            } else if url.starts_with("emoji/") {
+                update_entity_len!(MessageEntityCustomEmoji(offset) => entities);
             } else {
                 update_entity_len!(TextUrl(offset) => entities);
             }
@@ -233,7 +239,14 @@ pub fn generate_markdown_message(message: &str, entities: &[tl::enums::MessageEn
         ME::Blockquote(_) => {}
         ME::BankCard(_) => {}
         ME::Spoiler(_) => {}
-        ME::CustomEmoji(_) => {}
+        // [🔹](emoji/5388790256772331442)
+        ME::CustomEmoji(e) => {
+            insertions.push((e.offset, Cow::Borrowed("[")));
+            insertions.push((
+                e.offset + e.length,
+                Cow::Owned(format!("](emoji/{})", e.document_id)),
+            ));
+        }
     });
 
     inject_into_message(message, insertions)
