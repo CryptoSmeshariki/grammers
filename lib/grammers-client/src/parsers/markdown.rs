@@ -210,7 +210,7 @@ pub fn generate_markdown_message(message: &str, entities: &[tl::enums::MessageEn
                     after(i, 0, e.offset + e.length),
                     Segment::Fixed("](tg://emoji?id="),
                 ));
-                insertions.push((after(i, 1, e.offset + e.length), Segment::Number(e.user_id)));
+                insertions.push((after(i, 1, e.offset + e.length), Segment::Number(e.document_id)));
                 insertions.push((after(i, 2, e.offset + e.length), Segment::Fixed(")")));
             }
             ME::InputMessageEntityMentionName(_) => {}
