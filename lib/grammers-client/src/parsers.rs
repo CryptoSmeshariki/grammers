@@ -188,6 +188,7 @@ pub fn generate_markdown_message(message: &str, entities: &[tl::enums::MessageEn
                 ME::Pre(_) => 2,
                 ME::TextUrl(_) => 2,
                 ME::MentionName(_) => 2,
+                ME::CustomEmoji(_) => 2,
                 _ => 0,
             })
             .sum(),
