@@ -44,3 +44,7 @@ Used for benchmarking the encryption and decryption methods.
 ## toml
 
 Used to test that this file lists all dependencies from `Cargo.toml`.
+
+## num-traits
+
+Used for 2FA calculations
