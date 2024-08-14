@@ -5,18 +5,23 @@
 // <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
+
+#![deny(unsafe_code)]
+
 mod errors;
 mod reconnection;
 
 pub use crate::reconnection::*;
-use bytes::{Buf, BytesMut};
-pub use errors::{AuthorizationError, InvocationError, ReadError};
+pub use errors::{AuthorizationError, InvocationError, ReadError, RpcError};
 use futures_util::future::{pending, select, Either};
-use grammers_mtproto::mtp::{self, Mtp};
+use grammers_crypto::DequeBuffer;
+use grammers_mtproto::mtp::{
+    self, BadMessage, Deserialization, DeserializationFailure, Mtp, RpcResult, RpcResultError,
+};
 use grammers_mtproto::transport::{self, Transport};
 use grammers_mtproto::{authentication, MsgId};
 use grammers_tl_types::{self as tl, Deserializable, RemoteCall};
-use log::{debug, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use std::io;
 use std::io::Error;
 use std::ops::ControlFlow;
@@ -52,6 +57,12 @@ use {
 /// so to account for the transports' own overhead, we add a few extra
 /// kilobytes to the maximum data size.
 const MAXIMUM_DATA: usize = (1024 * 1024) + (8 * 1024);
+
+/// How much leading space should be reserved in a buffer to avoid moving memory.
+const LEADING_BUFFER_SPACE: usize = mtp::MAX_TRANSPORT_HEADER_LEN
+    + mtp::ENCRYPTED_PACKET_HEADER_LEN
+    + mtp::PLAIN_PACKET_HEADER_LEN
+    + mtp::MESSAGE_CONTAINER_HEADER_LEN;
 
 /// Every how often are pings sent?
 const PING_DELAY: Duration = Duration::from_secs(60);
@@ -105,7 +116,6 @@ pub struct Sender<T: Transport, M: Mtp> {
     stream: NetStream,
     transport: T,
     mtp: M,
-    mtp_buffer: BytesMut,
     addr: std::net::SocketAddr,
     #[cfg(feature = "proxy")]
     proxy_url: Option<String>,
@@ -115,9 +125,10 @@ pub struct Sender<T: Transport, M: Mtp> {
     reconnection_policy: &'static dyn ReconnectionPolicy,
 
     // Transport-level buffers and positions
-    read_buffer: BytesMut,
-    write_buffer: BytesMut,
-    write_index: usize,
+    read_buffer: Vec<u8>,
+    read_tail: usize,
+    write_buffer: DequeBuffer<u8>,
+    write_head: usize,
 }
 
 struct Request {
@@ -126,13 +137,28 @@ struct Request {
     result: oneshot::Sender<Result<Vec<u8>, InvocationError>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MsgIdPair {
+    msg_id: MsgId,
+    container_msg_id: MsgId,
+}
+
 enum RequestState {
     NotSerialized,
-    Serialized(MsgId),
-    Sent(MsgId),
+    Serialized(MsgIdPair),
+    Sent(MsgIdPair),
 }
 
 pub struct Enqueuer(mpsc::UnboundedSender<Request>);
+
+impl MsgIdPair {
+    fn new(msg_id: MsgId) -> Self {
+        Self {
+            msg_id,
+            container_msg_id: msg_id, // by default, no container (so the last msg_id is itself)
+        }
+    }
+}
 
 impl Enqueuer {
     /// Enqueue a Remote Procedure Call to be sent in future calls to `step`.
@@ -175,7 +201,6 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
                 stream,
                 transport,
                 mtp,
-                mtp_buffer: BytesMut::with_capacity(MAXIMUM_DATA),
                 addr,
                 #[cfg(feature = "proxy")]
                 proxy_url: None,
@@ -184,9 +209,10 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
                 next_ping: Instant::now() + PING_DELAY,
                 reconnection_policy,
 
-                read_buffer: BytesMut::with_capacity(MAXIMUM_DATA),
-                write_buffer: BytesMut::with_capacity(MAXIMUM_DATA),
-                write_index: 0,
+                read_buffer: vec![0; MAXIMUM_DATA],
+                read_tail: 0,
+                write_buffer: DequeBuffer::with_capacity(MAXIMUM_DATA, LEADING_BUFFER_SPACE),
+                write_head: 0,
             },
             Enqueuer(tx),
         ))
@@ -203,15 +229,12 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
         info!("connecting...");
 
         let stream = connect_proxy_stream(&addr, proxy_url).await?;
-
         let (tx, rx) = mpsc::unbounded_channel();
-
         Ok((
             Self {
                 stream,
                 transport,
                 mtp,
-                mtp_buffer: BytesMut::with_capacity(MAXIMUM_DATA),
                 addr,
                 proxy_url: Some(proxy_url.to_string()),
                 requests: vec![],
@@ -219,9 +242,10 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
                 next_ping: Instant::now() + PING_DELAY,
                 reconnection_policy,
 
-                read_buffer: BytesMut::with_capacity(MAXIMUM_DATA),
-                write_buffer: BytesMut::with_capacity(MAXIMUM_DATA),
-                write_index: 0,
+                read_buffer: vec![0; MAXIMUM_DATA],
+                read_tail: 0,
+                write_buffer: DequeBuffer::with_capacity(MAXIMUM_DATA, LEADING_BUFFER_SPACE),
+                write_head: 0,
             },
             Enqueuer(tx),
         ))
@@ -285,93 +309,54 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
             Write(io::Result<usize>),
         }
 
-        let mut attempts = 0u8;
-        loop {
-            if attempts > 5 {
-                log::error!(
-                    "attempted more than {} times for reconnection and failed",
-                    attempts
-                );
-                return Err(ReadError::Io(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    "read 0 bytes",
-                )));
+        self.try_fill_write();
+        let write_len = self.write_buffer.len() - self.write_head;
+        trace!(
+            "reading bytes and sending up to {} bytes via network",
+            write_len
+        );
+
+        let (mut reader, mut writer) = self.stream.split();
+        let sel = {
+            let sleep = pin!(async { sleep_until(self.next_ping).await });
+            let recv_req = pin!(async { self.request_rx.recv().await });
+            let recv_data =
+                pin!(async { reader.read(&mut self.read_buffer[self.read_tail..]).await });
+            let send_data = pin!(async {
+                if self.write_buffer.is_empty() {
+                    pending().await
+                } else {
+                    writer.write(&self.write_buffer[self.write_head..]).await
+                }
+            });
+
+            match select(select(sleep, recv_req), select(recv_data, send_data)).await {
+                Either::Left((Either::Left(_), _)) => Sel::Sleep,
+                Either::Left((Either::Right((request, _)), _)) => Sel::Request(request),
+                Either::Right((Either::Left((n, _)), _)) => Sel::Read(n),
+                Either::Right((Either::Right((n, _)), _)) => Sel::Write(n),
             }
+        };
 
-            self.try_fill_write();
-
-            // TODO probably want to properly set the request state on disconnect (read fail)
-
-            let write_len = self.write_buffer.len() - self.write_index;
-
-            let (mut reader, mut writer) = self.stream.split();
-            // TODO this always has to read the header of the packet and then the rest (2 or more calls)
-            // it would be better to always perform calls in a circular buffer to have as much data from
-            // the network as possible at all times, not just reading what's needed
-            // (perhaps something similar could be done with the write buffer to write packet after packet)
-            //
-            // The `request_rx.recv()` can't return `None` because we're holding a `tx`.
-            trace!(
-                "reading bytes and sending up to {} bytes via network",
-                write_len
-            );
-
-            let sel = {
-                let sleep = pin!(async { sleep_until(self.next_ping).await });
-                let recv_req = pin!(async { self.request_rx.recv().await });
-                let recv_data = pin!(async { reader.read_buf(&mut self.read_buffer).await });
-                let send_data = pin!(async {
-                    if self.write_buffer.is_empty() {
-                        pending().await
-                    } else {
-                        writer.write(&self.write_buffer[self.write_index..]).await
-                    }
-                });
-
-                match select(select(sleep, recv_req), select(recv_data, send_data)).await {
-                    Either::Left((Either::Left(_), _)) => Sel::Sleep,
-                    Either::Left((Either::Right((request, _)), _)) => Sel::Request(request),
-                    Either::Right((Either::Left((n, _)), _)) => Sel::Read(n),
-                    Either::Right((Either::Right((n, _)), _)) => Sel::Write(n),
-                }
-            };
-
-            let res = match sel {
-                Sel::Request(request) => {
-                    self.requests.push(request.unwrap());
-                    Ok(Vec::new())
-                }
-                Sel::Read(n) => n.map_err(ReadError::Io).and_then(|n| self.on_net_read(n)),
-                Sel::Write(n) => n.map_err(ReadError::Io).map(|n| {
-                    self.on_net_write(n);
-                    Vec::new()
-                }),
-                Sel::Sleep => {
-                    self.on_ping_timeout();
-                    Ok(Vec::new())
-                }
-            };
-
-            match res {
-                Ok(ok) => break Ok(ok),
-                Err(err) => {
-                    match err {
-                        ReadError::Io(_) => {}
-                        _ => {
-                            log::warn!("unhandled error: {}", &err);
-                            break Err(err);
-                        }
-                    }
-
-                    self.reset_state();
-
-                    self.try_connect().await?;
-                }
+        let res = match sel {
+            Sel::Request(request) => {
+                self.requests.push(request.unwrap());
+                Ok(Vec::new())
             }
+            Sel::Read(n) => n.map_err(ReadError::Io).and_then(|n| self.on_net_read(n)),
+            Sel::Write(n) => n.map_err(ReadError::Io).map(|n| {
+                self.on_net_write(n);
+                Vec::new()
+            }),
+            Sel::Sleep => {
+                self.on_ping_timeout();
+                Ok(Vec::new())
+            }
+        };
 
-            log::info!("retrying the call");
-
-            attempts += 1;
+        match res {
+            Ok(ok) => Ok(ok),
+            Err(err) => self.on_error(err).await,
         }
     }
 
@@ -391,14 +376,17 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
 
             match res {
                 Ok(result) => {
+                    log::info!(
+                        "auto-reconnect success after {} failed attempt(s)",
+                        attempts
+                    );
                     self.stream = result;
                     return Ok(());
                 }
                 Err(e) => {
-                    log::warn!("err: {}", e);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-
                     attempts += 1;
+                    log::warn!("auto-reconnect failed {} time(s): {}", attempts, e);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
 
                     match self.reconnection_policy.should_retry(attempts) {
                         ControlFlow::Break(_) => {
@@ -424,53 +412,46 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
         }
 
         // TODO add a test to make sure we only ever send the same request once
-        let requests = self
+        for request in self
             .requests
             .iter_mut()
-            .filter(|r| match r.state {
-                RequestState::NotSerialized => true,
-                RequestState::Serialized(_) | RequestState::Sent(_) => false,
-            })
-            .collect::<Vec<_>>();
-
-        // TODO add a test to make sure we don't send empty data
-        if requests.is_empty() {
-            return;
-        }
-
-        // TODO make mtp itself use BytesMut to avoid copies
-        let mut msg_ids = Vec::new();
-        for request in requests.iter() {
-            if let Some(msg_id) = self.mtp.push(&request.body) {
-                msg_ids.push(msg_id);
-            } else {
-                break;
-            }
-        }
-        self.write_buffer.clear();
-        self.mtp
-            .finalize(|mtp_buffer| self.transport.pack(&mtp_buffer, &mut self.write_buffer));
-
-        // NOTE: we have to use the FILTERED requests, not the saved ones.
-        // The key to finding this was printing the old and new state (but took ~2h to find).
-        // Otherwise we will likely change from Sent to Serialized and enter an infinite loop.
-        // This will very easily cause transport flood (using self, trying to upload two files at once).
-        // TODO add a test for this
-        requests
-            .into_iter()
-            .zip(msg_ids.into_iter())
-            .for_each(|(req, msg_id)| {
-                assert!(req.body.len() >= 4);
-                let req_id =
-                    u32::from_le_bytes([req.body[0], req.body[1], req.body[2], req.body[3]]);
+            .filter(|r| matches!(r.state, RequestState::NotSerialized))
+        {
+            // TODO make mtp itself use BytesMut to avoid copies
+            if let Some(msg_id) = self.mtp.push(&mut self.write_buffer, &request.body) {
+                assert!(request.body.len() >= 4);
+                let req_id = u32::from_le_bytes([
+                    request.body[0],
+                    request.body[1],
+                    request.body[2],
+                    request.body[3],
+                ]);
                 debug!(
                     "serialized request {:x} ({}) with {:?}",
                     req_id,
                     tl::name_for_id(req_id),
                     msg_id
                 );
-                req.state = RequestState::Serialized(msg_id);
-            });
+                // Note how only NotSerialized become Serialized.
+                // Nasty bugs that take ~2h to find occur otherwise!
+                // (e.g. infinite loops leading to transport flood.)
+                request.state = RequestState::Serialized(MsgIdPair::new(msg_id));
+            } else {
+                break;
+            }
+        }
+
+        if let Some(container_msg_id) = self.mtp.finalize(&mut self.write_buffer) {
+            for request in self.requests.iter_mut() {
+                match request.state {
+                    RequestState::Serialized(mut pair) => {
+                        pair.container_msg_id = container_msg_id;
+                    }
+                    RequestState::NotSerialized | RequestState::Sent(..) => {}
+                }
+            }
+            self.transport.pack(&mut self.write_buffer)
+        }
     }
 
     /// Handle `n` more read bytes being ready to process by the transport.
@@ -484,56 +465,61 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
             )));
         }
 
+        self.read_tail += n;
         trace!("read {} bytes from the network", n);
-
-        trace!(
-            "trying to unpack buffer of {} bytes...",
-            self.read_buffer.len()
-        );
+        trace!("trying to unpack buffer of {} bytes...", self.read_tail);
 
         // TODO the buffer might have multiple transport packets, what should happen with the
         // updates successfully read if subsequent packets fail to be deserialized properly?
         let mut updates = Vec::new();
-        while !self.read_buffer.is_empty() {
-            self.mtp_buffer.clear();
+        let mut next_offset = 0;
+        while next_offset != self.read_tail {
             match self
                 .transport
-                .unpack(&self.read_buffer, &mut self.mtp_buffer)
+                .unpack(&self.read_buffer[next_offset..self.read_tail])
             {
-                Ok(n) => {
-                    self.read_buffer.advance(n);
-                    self.process_mtp_buffer(&mut updates)?;
+                Ok(offset) => {
+                    debug!("deserializing valid transport packet...");
+                    let result = self.mtp.deserialize(
+                        &self.read_buffer[next_offset..][offset.data_start..offset.data_end],
+                    )?;
+
+                    self.process_mtp_buffer(result, &mut updates);
+                    next_offset += offset.next_offset;
                 }
                 Err(transport::Error::MissingBytes) => break,
                 Err(err) => return Err(err.into()),
             }
         }
 
+        self.read_buffer.copy_within(next_offset..self.read_tail, 0);
+        self.read_tail -= next_offset;
+
         Ok(updates)
     }
 
     /// Handle `n` more written bytes being ready to process by the transport.
     fn on_net_write(&mut self, n: usize) {
-        self.write_index += n;
+        self.write_head += n;
         trace!(
             "written {} bytes to the network ({}/{})",
             n,
-            self.write_index,
+            self.write_head,
             self.write_buffer.len()
         );
-        assert!(self.write_index <= self.write_buffer.len());
-        if self.write_index != self.write_buffer.len() {
+        assert!(self.write_head <= self.write_buffer.len());
+        if self.write_head != self.write_buffer.len() {
             return;
         }
 
         self.write_buffer.clear();
-        self.write_index = 0;
+        self.write_head = 0;
         for req in self.requests.iter_mut() {
             match req.state {
                 RequestState::NotSerialized | RequestState::Sent(_) => {}
-                RequestState::Serialized(msg_id) => {
-                    debug!("sent request with {:?}", msg_id);
-                    req.state = RequestState::Sent(msg_id);
+                RequestState::Serialized(pair) => {
+                    debug!("sent request with {:?}", pair);
+                    req.state = RequestState::Sent(pair);
                 }
             }
         }
@@ -555,36 +541,99 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
         self.next_ping = Instant::now() + PING_DELAY;
     }
 
-    /// Process the `mtp_buffer` contents and dispatch the results and errors.
+    /// Handle errors that occured while performing I/O.
+    async fn on_error(&mut self, error: ReadError) -> Result<Vec<tl::enums::Updates>, ReadError> {
+        log::info!("handling error: {error}");
+        self.transport.reset();
+        self.mtp.reset();
+        log::info!(
+            "resetting sender state from read_buffer {}/{}, write_buffer {}/{}",
+            self.read_tail,
+            self.read_buffer.len(),
+            self.write_head,
+            self.write_buffer.len(),
+        );
+        self.read_tail = 0;
+        self.read_buffer.fill(0);
+        self.write_head = 0;
+        self.write_buffer.clear();
+
+        let error = match error {
+            ReadError::Io(_)
+                if matches!(
+                    self.reconnection_policy.should_retry(0),
+                    ControlFlow::Continue(_)
+                ) =>
+            {
+                match self.try_connect().await {
+                    Ok(_) => {
+                        // Reconnect success means everything can be retried.
+                        self.requests
+                            .iter_mut()
+                            .for_each(|r| r.state = RequestState::NotSerialized);
+
+                        return Ok(Vec::new());
+                    }
+                    Err(e) => ReadError::from(e),
+                }
+            }
+            e => e,
+        };
+
+        log::warn!(
+            "marking all {} request(s) as failed: {}",
+            self.requests.len(),
+            &error
+        );
+
+        self.requests
+            .drain(..)
+            .for_each(|r| drop(r.result.send(Err(InvocationError::from(error.clone())))));
+
+        Err(error)
+    }
+
+    /// Process the result of deserializing an MTP buffer.
     fn process_mtp_buffer(
         &mut self,
+        results: Vec<Deserialization>,
         updates: &mut Vec<tl::enums::Updates>,
-    ) -> Result<(), mtp::DeserializeError> {
-        debug!("deserializing valid transport packet...");
-        let result = self.mtp.deserialize(&self.mtp_buffer)?;
+    ) {
+        for result in results {
+            match result {
+                Deserialization::Update(update) => self.process_update(updates, update),
+                Deserialization::RpcResult(result) => self.process_result(result),
+                Deserialization::RpcError(error) => self.process_error(error),
+                Deserialization::BadMessage(bad_msg) => self.process_bad_message(bad_msg),
+                Deserialization::Failure(failure) => self.process_deserialize_error(failure),
+            }
+        }
+    }
 
-        updates.extend(result.updates.iter().filter_map(|update| {
-            match tl::enums::Updates::from_bytes(update) {
-                Ok(u) => Some(u),
-                Err(e) => {
-                    // Annoyingly enough, `messages.affectedMessages` also has `pts`.
-                    // Mostly received when deleting messages, so pretend that's the
-                    // update that actually occured.
-                    match tl::enums::messages::AffectedMessages::from_bytes(update) {
-                        Ok(tl::enums::messages::AffectedMessages::Messages(
-                            tl::types::messages::AffectedMessages { pts, pts_count },
-                        )) => Some(
-                            tl::types::UpdateShort {
-                                update: tl::types::UpdateDeleteMessages {
-                                    messages: Vec::new(),
-                                    pts,
-                                    pts_count,
-                                }
-                                .into(),
-                                date: 0,
+    fn process_update(&mut self, updates: &mut Vec<tl::enums::Updates>, update: Vec<u8>) {
+        let update = match tl::enums::Updates::from_bytes(&update) {
+            Ok(u) => Some(u),
+            Err(e) => {
+                // Annoyingly enough, `messages.affectedMessages` also has `pts`.
+                // Mostly received when deleting messages, so pretend that's the
+                // update that actually occured.
+                match tl::enums::messages::AffectedMessages::from_bytes(&update) {
+                    Ok(tl::enums::messages::AffectedMessages::Messages(
+                        tl::types::messages::AffectedMessages { pts, pts_count },
+                    )) => Some(
+                        tl::types::UpdateShort {
+                            update: tl::types::UpdateDeleteMessages {
+                                messages: Vec::new(),
+                                pts,
+                                pts_count,
                             }
                             .into(),
-                        ),
+                            date: 0,
+                        }
+                        .into(),
+                    ),
+                    Err(_) => match tl::types::messages::InvitedUsers::from_bytes(&update) {
+                        Ok(u) => Some(u.updates),
                         Err(_) => {
                             warn!(
                                 "telegram sent updates that failed to be deserialized: {}",
@@ -592,85 +641,131 @@ impl<T: Transport, M: Mtp> Sender<T, M> {
                             );
                             None
                         }
-                    }
+                    },
                 }
             }
-        }));
+        };
 
-        for (msg_id, ret) in result.rpc_results {
-            let mut found = false;
-            for i in (0..self.requests.len()).rev() {
-                let req = &mut self.requests[i];
-                match req.state {
-                    RequestState::Serialized(sid) if sid == msg_id => {
-                        panic!("got rpc result {:?} for unsent request {:?}", msg_id, sid);
-                    }
-                    RequestState::Sent(sid) if sid == msg_id => {
-                        found = true;
-                        let result = match ret {
-                            Ok(x) => {
-                                assert!(x.len() >= 4);
-                                let res_id = u32::from_le_bytes([x[0], x[1], x[2], x[3]]);
-                                debug!(
-                                    "got result {:x} ({}) for request {:?}",
-                                    res_id,
-                                    tl::name_for_id(res_id),
-                                    msg_id
-                                );
-                                Ok(x)
-                            }
-                            Err(mtp::RequestError::RpcError(mut error)) => {
-                                debug!("got rpc error {:?} for request {:?}", error, msg_id);
-                                let x = req.body.as_slice();
-                                error.caused_by =
-                                    Some(u32::from_le_bytes([x[0], x[1], x[2], x[3]]));
-                                Err(InvocationError::Rpc(error))
-                            }
-                            Err(mtp::RequestError::Dropped) => {
-                                debug!("response for request {:?} dropped", msg_id);
-                                Err(InvocationError::Dropped)
-                            }
-                            Err(mtp::RequestError::Deserialize(error)) => {
-                                debug!(
-                                    "got deserialize error {:?} for request {:?}",
-                                    error, msg_id
-                                );
-                                Err(InvocationError::Read(error.into()))
-                            }
-                            Err(err @ mtp::RequestError::BadMessage { .. }) => {
-                                // TODO add a test to make sure we resend the request
-                                info!("{}; re-sending request {:?}", err, msg_id);
-                                req.state = RequestState::NotSerialized;
-                                break;
-                            }
-                        };
+        if let Some(update) = update {
+            updates.push(update);
+        }
+    }
 
-                        let req = self.requests.remove(i);
-                        drop(req.result.send(result));
-                        break;
-                    }
-                    _ => {}
+    fn process_result(&mut self, result: RpcResult) {
+        if let Some(req) = self.pop_request(result.msg_id) {
+            let x = result.body;
+            assert!(x.len() >= 4);
+            let res_id = u32::from_le_bytes([x[0], x[1], x[2], x[3]]);
+            debug!(
+                "got result {:x} ({}) for request {:?}",
+                res_id,
+                tl::name_for_id(res_id),
+                result.msg_id
+            );
+            drop(req.result.send(Ok(x)));
+        } else {
+            info!(
+                "got rpc result {:?} but no such request is saved",
+                result.msg_id
+            );
+        }
+    }
+
+    fn process_error(&mut self, error: RpcResultError) {
+        if let Some(req) = self.pop_request(error.msg_id) {
+            debug!("got rpc error {:?}", error.error);
+            let x = req.body.as_slice();
+            drop(
+                req.result.send(Err(InvocationError::Rpc(
+                    RpcError::from(error.error)
+                        .with_caused_by(u32::from_le_bytes([x[0], x[1], x[2], x[3]])),
+                ))),
+            );
+        } else {
+            info!(
+                "got rpc error {:?} but no such request is saved",
+                error.msg_id
+            );
+        }
+    }
+
+    fn process_bad_message(&mut self, bad_msg: BadMessage) {
+        for i in (0..self.requests.len()).rev() {
+            match self.requests[i].state {
+                RequestState::Serialized(pair)
+                    if pair.msg_id == bad_msg.msg_id || pair.container_msg_id == bad_msg.msg_id =>
+                {
+                    panic!(
+                        "bad msg for unsent request {:?}: {}",
+                        bad_msg.msg_id,
+                        bad_msg.description()
+                    );
                 }
-            }
+                RequestState::Sent(pair)
+                    if pair.msg_id == bad_msg.msg_id || pair.container_msg_id == bad_msg.msg_id =>
+                {
+                    // TODO add a test to make sure we resend the request
+                    if bad_msg.retryable() {
+                        info!(
+                            "{}; re-sending request {:?}",
+                            bad_msg.description(),
+                            pair.msg_id
+                        );
 
-            if !found {
-                info!("got rpc result {:?} but no such request is saved", msg_id);
+                        // TODO check if actually retryable first!
+                        self.requests[i].state = RequestState::NotSerialized;
+                    } else {
+                        if bad_msg.fatal() {
+                            error!(
+                                "{}; canont retry request {:?}",
+                                bad_msg.description(),
+                                pair.msg_id
+                            );
+                        } else {
+                            warn!(
+                                "{}; canont retry request {:?}",
+                                bad_msg.description(),
+                                pair.msg_id
+                            );
+                        }
+                        let req = self.requests.swap_remove(i);
+                        drop(req.result.send(Err(InvocationError::Dropped)));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn process_deserialize_error(&mut self, failure: DeserializationFailure) {
+        if let Some(req) = self.pop_request(failure.msg_id) {
+            debug!("got deserialization failure {:?}", failure.error);
+            drop(
+                req.result
+                    .send(Err(InvocationError::Read(failure.error.into()))),
+            );
+        } else {
+            info!(
+                "got deserialization failure {:?} but no such request is saved",
+                failure.error
+            );
+        }
+    }
+
+    fn pop_request(&mut self, msg_id: MsgId) -> Option<Request> {
+        for i in 0..self.requests.len() {
+            match self.requests[i].state {
+                RequestState::Serialized(pair) if pair.msg_id == msg_id => {
+                    panic!("got response {msg_id:?} for unsent request {pair:?}");
+                }
+                RequestState::Sent(pair) if pair.msg_id == msg_id => {
+                    return Some(self.requests.swap_remove(i))
+                }
+                _ => {}
             }
         }
 
-        Ok(())
-    }
-
-    fn reset_state(&mut self) {
-        self.transport.reset();
-        self.mtp.reset();
-        self.mtp_buffer.clear();
-        self.read_buffer.clear();
-        self.write_index = 0;
-        self.write_buffer.clear();
-        self.requests
-            .iter_mut()
-            .for_each(|r| r.state = RequestState::NotSerialized);
+        None
     }
 }
 
@@ -703,7 +798,7 @@ pub async fn connect_via_proxy<'a, T: Transport>(
 
 async fn connect_stream(addr: &std::net::SocketAddr) -> Result<NetStream, std::io::Error> {
     info!("connecting...");
-    Ok(NetStream::Tcp(TcpStream::connect(addr.clone()).await?))
+    Ok(NetStream::Tcp(TcpStream::connect(addr).await?))
 }
 
 #[cfg(feature = "proxy")]
@@ -795,13 +890,13 @@ pub async fn generate_auth_key<T: Transport>(
                 .time_offset(time_offset)
                 .first_salt(first_salt)
                 .finish(auth_key),
-            mtp_buffer: sender.mtp_buffer,
             requests: sender.requests,
             request_rx: sender.request_rx,
             next_ping: Instant::now() + PING_DELAY,
             read_buffer: sender.read_buffer,
+            read_tail: sender.read_tail,
             write_buffer: sender.write_buffer,
-            write_index: sender.write_index,
+            write_head: sender.write_head,
             addr: sender.addr,
             #[cfg(feature = "proxy")]
             proxy_url: sender.proxy_url,
